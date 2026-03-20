@@ -62,7 +62,7 @@ class SolisModbusConfigFlow(ConfigFlow, domain=DOMAIN):
                     errors["base"] = "cannot_connect"
                 else:
                     result = await client.read_input_registers(
-                        33000, 1, slave_id
+                        33000, count=1, unit=slave_id
                     )
                     if result.isError():
                         _LOGGER.error(
