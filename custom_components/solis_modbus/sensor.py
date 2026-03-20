@@ -12,6 +12,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     PERCENTAGE,
+    UnitOfApparentPower,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfEnergy,
@@ -217,7 +218,7 @@ SENSOR_DESCRIPTIONS: tuple[SolisSensorEntityDescription, ...] = (
         key="apparent_power",
         data_key="apparent_power",
         translation_key="apparent_power",
-        native_unit_of_measurement=UnitOfPower.VOLT_AMPERE,
+        native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
         device_class=SensorDeviceClass.APPARENT_POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
