@@ -150,6 +150,10 @@ async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
         result = await client.read_input_registers(address, count=count, device_id=slave_id)
         if result.isError():
             raise RuntimeError(f"Modbus error reading register {address}: {result}")
+        if len(result.registers) < count:
+            raise RuntimeError(
+                f"Short read at register {address}: expected {count}, got {len(result.registers)}"
+            )
         return result.registers
 
     data = {}
