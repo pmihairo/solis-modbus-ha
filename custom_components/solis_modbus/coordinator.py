@@ -88,7 +88,7 @@ class SolisModbusCoordinator(DataUpdateCoordinator):
         """Fetch data from the inverter."""
         try:
             await self._ensure_connected()
-        except (ModbusException, OSError) as err:
+        except Exception as err:
             raise UpdateFailed(f"Connection error: {err}") from err
 
         data = {}
@@ -182,7 +182,7 @@ class SolisModbusCoordinator(DataUpdateCoordinator):
             regs = await self._read_input_registers(33132, 1)
             data["storage_control_mode"] = _u16(regs, 0)
 
-        except (ModbusException, OSError) as err:
+        except Exception as err:
             raise UpdateFailed(f"Error reading data: {err}") from err
 
         return data

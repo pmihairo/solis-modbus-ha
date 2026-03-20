@@ -54,18 +54,20 @@ class SolisModbusConfigFlow(ConfigFlow, domain=DOMAIN):
             slave_id = user_input[CONF_SLAVE_ID]
 
             # Test connection
+            client = None
             try:
                 client = AsyncModbusTcpClient(host=host, port=port, timeout=5)
                 await client.connect()
                 if not client.connected:
                     errors["base"] = "cannot_connect"
                 else:
-                    # Try reading the model register to verify it's a Solis inverter
                     result = await client.read_input_registers(
                         address=33000, count=1, slave=slave_id
                     )
-                    client.close()
                     if result.isError():
+                        _LOGGER.error(
+                            "Modbus read test failed at register 33000: %s", result
+                        )
                         errors["base"] = "cannot_connect"
                     else:
                         await self.async_set_unique_id(f"solis_{host}_{slave_id}")
@@ -74,9 +76,14 @@ class SolisModbusConfigFlow(ConfigFlow, domain=DOMAIN):
                             title=f"Solis Inverter ({host})",
                             data=user_input,
                         )
-            except (ModbusException, OSError) as err:
-                _LOGGER.error("Connection test failed: %s", err)
+            except Exception as err:
+                _LOGGER.error(
+                    "Connection test failed (%s): %s", type(err).__name__, err
+                )
                 errors["base"] = "cannot_connect"
+            finally:
+                if client:
+                    client.close()
 
         return self.async_show_form(
             step_id="user",
