@@ -1,0 +1,377 @@
+"""Solis S6 Hybrid Inverter -> MQTT bridge with Home Assistant auto-discovery."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import signal
+import struct
+import sys
+from dataclasses import dataclass
+
+from pymodbus.client import AsyncModbusTcpClient
+import aiomqtt
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+_LOGGER = logging.getLogger("solis2mqtt")
+
+MQTT_BASE_TOPIC = "solis"
+HA_DISCOVERY_PREFIX = "homeassistant"
+
+
+# --- Modbus helpers ---
+
+def _u16(regs, i):
+    return regs[i]
+
+def _s16(regs, i):
+    val = regs[i]
+    return val if val < 0x8000 else val - 0x10000
+
+def _u32(regs, i):
+    return (regs[i] << 16) | regs[i + 1]
+
+def _s32(regs, i):
+    raw = (regs[i] << 16) | regs[i + 1]
+    return struct.unpack(">i", struct.pack(">I", raw))[0]
+
+
+# --- Sensor definitions ---
+
+@dataclass
+class SensorDef:
+    key: str
+    name: str
+    unit: str | None = None
+    device_class: str | None = None
+    state_class: str | None = None
+    icon: str | None = None
+    precision: int | None = None
+
+
+SENSORS: list[SensorDef] = [
+    # PV inputs
+    SensorDef("dc_voltage_1", "PV1 Voltage", "V", "voltage", "measurement", precision=1),
+    SensorDef("dc_current_1", "PV1 Current", "A", "current", "measurement", precision=1),
+    SensorDef("dc_voltage_2", "PV2 Voltage", "V", "voltage", "measurement", precision=1),
+    SensorDef("dc_current_2", "PV2 Current", "A", "current", "measurement", precision=1),
+    SensorDef("dc_voltage_3", "PV3 Voltage", "V", "voltage", "measurement", precision=1),
+    SensorDef("dc_current_3", "PV3 Current", "A", "current", "measurement", precision=1),
+    SensorDef("dc_voltage_4", "PV4 Voltage", "V", "voltage", "measurement", precision=1),
+    SensorDef("dc_current_4", "PV4 Current", "A", "current", "measurement", precision=1),
+    SensorDef("total_dc_power", "Total DC Power", "W", "power", "measurement"),
+    # AC output
+    SensorDef("ac_voltage_a", "AC Voltage Phase A", "V", "voltage", "measurement", precision=1),
+    SensorDef("ac_voltage_b", "AC Voltage Phase B", "V", "voltage", "measurement", precision=1),
+    SensorDef("ac_voltage_c", "AC Voltage Phase C", "V", "voltage", "measurement", precision=1),
+    SensorDef("ac_current_a", "AC Current Phase A", "A", "current", "measurement", precision=1),
+    SensorDef("ac_current_b", "AC Current Phase B", "A", "current", "measurement", precision=1),
+    SensorDef("ac_current_c", "AC Current Phase C", "A", "current", "measurement", precision=1),
+    SensorDef("active_power", "Active Power", "W", "power", "measurement"),
+    SensorDef("reactive_power", "Reactive Power", "var", None, "measurement", icon="mdi:flash"),
+    SensorDef("apparent_power", "Apparent Power", "VA", "apparent_power", "measurement"),
+    SensorDef("grid_frequency", "Grid Frequency", "Hz", "frequency", "measurement", precision=2),
+    SensorDef("inverter_temperature", "Inverter Temperature", "°C", "temperature", "measurement", precision=1),
+    SensorDef("inverter_status", "Inverter Status", None, None, None, icon="mdi:information-outline"),
+    # Battery
+    SensorDef("battery_voltage", "Battery Voltage", "V", "voltage", "measurement", precision=1),
+    SensorDef("battery_current", "Battery Current", "A", "current", "measurement", precision=1),
+    SensorDef("battery_power", "Battery Power", "W", "power", "measurement"),
+    SensorDef("battery_soc", "Battery SOC", "%", "battery", "measurement"),
+    SensorDef("battery_soh", "Battery SOH", "%", None, "measurement", icon="mdi:battery-heart-variant"),
+    # Grid / Meter
+    SensorDef("meter_active_power", "Grid Power (Meter)", "W", "power", "measurement"),
+    SensorDef("grid_port_power", "Grid Port Power", "W", "power", "measurement"),
+    # Loads
+    SensorDef("household_load_power", "Household Load Power", "W", "power", "measurement"),
+    SensorDef("backup_load_power", "Backup Load Power", "W", "power", "measurement"),
+    # Energy - generation
+    SensorDef("total_energy", "Total Energy Generated", "kWh", "energy", "total_increasing"),
+    SensorDef("today_energy", "Today Energy Generated", "kWh", "energy", "total_increasing", precision=1),
+    SensorDef("yesterday_energy", "Yesterday Energy Generated", "kWh", "energy", None, precision=1),
+    SensorDef("month_energy", "This Month Energy", "kWh", "energy", None),
+    SensorDef("year_energy", "This Year Energy", "kWh", "energy", None),
+    # Energy - battery
+    SensorDef("battery_total_charge_energy", "Battery Total Charge Energy", "kWh", "energy", "total_increasing"),
+    SensorDef("today_battery_charge_energy", "Today Battery Charge Energy", "kWh", "energy", "total_increasing", precision=1),
+    SensorDef("battery_total_discharge_energy", "Battery Total Discharge Energy", "kWh", "energy", "total_increasing"),
+    SensorDef("today_battery_discharge_energy", "Today Battery Discharge Energy", "kWh", "energy", "total_increasing", precision=1),
+    # Energy - grid
+    SensorDef("total_grid_import_energy", "Total Grid Import Energy", "kWh", "energy", "total_increasing"),
+    SensorDef("today_grid_import_energy", "Today Grid Import Energy", "kWh", "energy", "total_increasing", precision=1),
+    SensorDef("total_grid_export_energy", "Total Grid Export Energy", "kWh", "energy", "total_increasing"),
+    SensorDef("today_grid_export_energy", "Today Grid Export Energy", "kWh", "energy", "total_increasing", precision=1),
+    # Energy - load
+    SensorDef("total_load_energy", "Total Load Energy", "kWh", "energy", "total_increasing"),
+    SensorDef("today_load_energy", "Today Load Energy", "kWh", "energy", "total_increasing", precision=1),
+    # Storage mode
+    SensorDef("storage_control_mode", "Storage Control Mode", None, None, None, icon="mdi:battery-sync"),
+]
+
+INVERTER_STATUS_MAP = {
+    0x0000: "Normal operation",
+    0x0001: "Open operating",
+    0x0002: "Waiting",
+    0x0003: "Initializing",
+    0x0004: "Bypass inverting running",
+    0x0005: "Bypass inverting synchronize",
+    0x0006: "Bypass grid running",
+    0x000F: "Normal running",
+    0x1004: "Grid off",
+    0x1010: "Grid overvoltage",
+    0x1011: "Grid undervoltage",
+    0x1012: "Grid overfrequency",
+    0x1013: "Grid underfrequency",
+    0x1015: "No grid",
+}
+
+STORAGE_MODE_FLAGS = {
+    0: "Self-consumption",
+    1: "Time-charging",
+    2: "Off-grid",
+    3: "Battery wakeup",
+    4: "Battery reserve",
+    5: "Grid charge allowed",
+}
+
+
+# --- Modbus reading ---
+
+async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
+    """Read all sensor data from the inverter."""
+
+    async def read(address: int, count: int) -> list[int]:
+        result = await client.read_input_registers(address, count=count, device_id=slave_id)
+        if result.isError():
+            raise RuntimeError(f"Modbus error reading register {address}: {result}")
+        return result.registers
+
+    data = {}
+
+    # Model and serial (33000-33027)
+    regs = await read(33000, 28)
+    sn_chars = []
+    for i in range(4, 20):
+        val = _u16(regs, i)
+        high = (val >> 8) & 0xFF
+        low = val & 0xFF
+        if high > 0:
+            sn_chars.append(chr(high))
+        if low > 0:
+            sn_chars.append(chr(low))
+    data["serial_number"] = "".join(sn_chars)
+
+    # Energy (33029-33040)
+    regs = await read(33029, 12)
+    data["total_energy"] = _u32(regs, 0)
+    data["month_energy"] = _u32(regs, 2)
+    data["today_energy"] = round(_u16(regs, 6) * 0.1, 1)
+    data["yesterday_energy"] = round(_u16(regs, 7) * 0.1, 1)
+    data["year_energy"] = _u32(regs, 8)
+
+    # DC inputs (33049-33058)
+    regs = await read(33049, 10)
+    for n in range(4):
+        data[f"dc_voltage_{n+1}"] = round(_u16(regs, n * 2) * 0.1, 1)
+        data[f"dc_current_{n+1}"] = round(_u16(regs, n * 2 + 1) * 0.1, 1)
+    data["total_dc_power"] = _u32(regs, 8)
+
+    # AC output & grid (33071-33095)
+    regs = await read(33071, 25)
+    data["ac_voltage_a"] = round(_u16(regs, 2) * 0.1, 1)
+    data["ac_voltage_b"] = round(_u16(regs, 3) * 0.1, 1)
+    data["ac_voltage_c"] = round(_u16(regs, 4) * 0.1, 1)
+    data["ac_current_a"] = round(_u16(regs, 5) * 0.1, 1)
+    data["ac_current_b"] = round(_u16(regs, 6) * 0.1, 1)
+    data["ac_current_c"] = round(_u16(regs, 7) * 0.1, 1)
+    data["active_power"] = _s32(regs, 8)
+    data["reactive_power"] = _s32(regs, 10)
+    data["apparent_power"] = _s32(regs, 12)
+    data["inverter_temperature"] = round(_s16(regs, 22) * 0.1, 1)
+    data["grid_frequency"] = round(_u16(regs, 23) * 0.01, 2)
+    status_raw = _u16(regs, 24)
+    data["inverter_status"] = INVERTER_STATUS_MAP.get(status_raw, f"Unknown (0x{status_raw:04X})")
+
+    # Meter & battery (33126-33148)
+    regs = await read(33126, 23)
+    data["meter_active_power"] = _s32(regs, 4)
+    data["battery_voltage"] = round(_u16(regs, 7) * 0.1, 1)
+    data["battery_current"] = round(_s16(regs, 8) * 0.1, 1)
+    data["battery_soc"] = _u16(regs, 13)
+    data["battery_soh"] = _u16(regs, 14)
+    data["household_load_power"] = _u16(regs, 21)
+    data["backup_load_power"] = _u16(regs, 22)
+
+    # Battery & grid port power (33149-33157)
+    regs = await read(33149, 9)
+    data["battery_power"] = _s32(regs, 0)
+    data["grid_port_power"] = _s32(regs, 2)
+
+    # Battery/grid/load energy (33161-33180)
+    regs = await read(33161, 20)
+    data["battery_total_charge_energy"] = _u32(regs, 0)
+    data["today_battery_charge_energy"] = round(_u16(regs, 2) * 0.1, 1)
+    data["battery_total_discharge_energy"] = _u32(regs, 4)
+    data["today_battery_discharge_energy"] = round(_u16(regs, 6) * 0.1, 1)
+    data["total_grid_import_energy"] = _u32(regs, 8)
+    data["today_grid_import_energy"] = round(_u16(regs, 10) * 0.1, 1)
+    data["total_grid_export_energy"] = _u32(regs, 12)
+    data["today_grid_export_energy"] = round(_u16(regs, 14) * 0.1, 1)
+    data["total_load_energy"] = _u32(regs, 16)
+    data["today_load_energy"] = round(_u16(regs, 18) * 0.1, 1)
+
+    # Storage control mode (33132)
+    regs = await read(33132, 1)
+    mode_raw = _u16(regs, 0)
+    active = [name for bit, name in STORAGE_MODE_FLAGS.items() if mode_raw & (1 << bit)]
+    data["storage_control_mode"] = ", ".join(active) if active else "None"
+
+    return data
+
+
+# --- MQTT publishing ---
+
+async def publish_ha_discovery(mqtt: aiomqtt.Client, serial: str) -> None:
+    """Publish Home Assistant MQTT auto-discovery config for all sensors."""
+    device = {
+        "identifiers": [f"solis_{serial}"],
+        "name": f"Solis Inverter {serial}",
+        "manufacturer": "Ginlong Solis",
+        "model": "S6 Hybrid",
+    }
+
+    for sensor in SENSORS:
+        topic = f"{HA_DISCOVERY_PREFIX}/sensor/solis_{serial}/{sensor.key}/config"
+        payload = {
+            "name": sensor.name,
+            "unique_id": f"solis_{serial}_{sensor.key}",
+            "state_topic": f"{MQTT_BASE_TOPIC}/{serial}/{sensor.key}",
+            "device": device,
+            "availability_topic": f"{MQTT_BASE_TOPIC}/{serial}/availability",
+        }
+        if sensor.unit:
+            payload["unit_of_measurement"] = sensor.unit
+        if sensor.device_class:
+            payload["device_class"] = sensor.device_class
+        if sensor.state_class:
+            payload["state_class"] = sensor.state_class
+        if sensor.icon:
+            payload["icon"] = sensor.icon
+
+        await mqtt.publish(topic, json.dumps(payload), retain=True)
+
+    _LOGGER.info("Published HA discovery config for %d sensors", len(SENSORS))
+
+
+async def publish_state(mqtt: aiomqtt.Client, serial: str, data: dict) -> None:
+    """Publish sensor values to MQTT."""
+    for sensor in SENSORS:
+        value = data.get(sensor.key)
+        if value is not None:
+            topic = f"{MQTT_BASE_TOPIC}/{serial}/{sensor.key}"
+            await mqtt.publish(topic, str(value))
+
+    await mqtt.publish(f"{MQTT_BASE_TOPIC}/{serial}/availability", "online", retain=True)
+
+
+# --- Main loop ---
+
+async def main(
+    modbus_host: str,
+    modbus_port: int,
+    slave_id: int,
+    mqtt_host: str,
+    mqtt_port: int,
+    mqtt_user: str | None,
+    mqtt_pass: str | None,
+    interval: int,
+):
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    _LOGGER.info(
+        "Starting solis2mqtt: Modbus %s:%d (slave %d) -> MQTT %s:%d (every %ds)",
+        modbus_host, modbus_port, slave_id, mqtt_host, mqtt_port, interval,
+    )
+
+    modbus = AsyncModbusTcpClient(host=modbus_host, port=modbus_port, timeout=10)
+    serial = None
+
+    async with aiomqtt.Client(
+        hostname=mqtt_host,
+        port=mqtt_port,
+        username=mqtt_user,
+        password=mqtt_pass,
+    ) as mqtt:
+        while not stop_event.is_set():
+            try:
+                if not modbus.connected:
+                    await modbus.connect()
+                    if not modbus.connected:
+                        _LOGGER.error("Cannot connect to inverter, retrying in %ds", interval)
+                        await asyncio.sleep(interval)
+                        continue
+
+                data = await read_inverter(modbus, slave_id)
+
+                if serial is None:
+                    serial = data["serial_number"]
+                    _LOGGER.info("Inverter serial: %s", serial)
+                    await publish_ha_discovery(mqtt, serial)
+
+                await publish_state(mqtt, serial, data)
+                _LOGGER.debug("Published %d sensor values", len(data) - 1)
+
+            except Exception:
+                _LOGGER.exception("Error in poll loop")
+                if modbus.connected:
+                    modbus.close()
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+        # Publish offline on clean shutdown
+        if serial:
+            await mqtt.publish(f"{MQTT_BASE_TOPIC}/{serial}/availability", "offline", retain=True)
+
+    modbus.close()
+    _LOGGER.info("Stopped.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Solis S6 Modbus TCP to MQTT bridge")
+    parser.add_argument("--modbus-host", required=True, help="Inverter/datalogger IP")
+    parser.add_argument("--modbus-port", type=int, default=502)
+    parser.add_argument("--slave-id", type=int, default=1)
+    parser.add_argument("--mqtt-host", default=os.environ.get("MQTT_HOST", "localhost"))
+    parser.add_argument("--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT", "1883")))
+    parser.add_argument("--mqtt-user", default=os.environ.get("MQTT_USER"))
+    parser.add_argument("--mqtt-pass", default=os.environ.get("MQTT_PASS"))
+    parser.add_argument("--interval", type=int, default=30, help="Poll interval in seconds")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    asyncio.run(main(
+        modbus_host=args.modbus_host,
+        modbus_port=args.modbus_port,
+        slave_id=args.slave_id,
+        mqtt_host=args.mqtt_host,
+        mqtt_port=args.mqtt_port,
+        mqtt_user=args.mqtt_user,
+        mqtt_pass=args.mqtt_pass,
+        interval=args.interval,
+    ))
