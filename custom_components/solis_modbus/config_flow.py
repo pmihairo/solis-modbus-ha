@@ -6,10 +6,10 @@ import logging
 
 import voluptuous as vol
 from pymodbus.client import AsyncModbusTcpClient
-from pymodbus.exceptions import ModbusException
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
+from .modbus_helpers import read_input_registers
 from .const import (
     CONF_HOST,
     CONF_PORT,
@@ -61,8 +61,8 @@ class SolisModbusConfigFlow(ConfigFlow, domain=DOMAIN):
                 if not client.connected:
                     errors["base"] = "cannot_connect"
                 else:
-                    result = await client.read_input_registers(
-                        33000, count=1, unit=slave_id
+                    result = await read_input_registers(
+                        client, 33000, 1, slave_id
                     )
                     if result.isError():
                         _LOGGER.error(

@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import CONF_HOST, CONF_PORT, CONF_SLAVE_ID, CONF_SCAN_INTERVAL
+from .modbus_helpers import read_input_registers
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,8 +78,8 @@ class SolisModbusCoordinator(DataUpdateCoordinator):
 
     async def _read_input_registers(self, address: int, count: int) -> list[int]:
         """Read input registers (function code 0x04)."""
-        result = await self._client.read_input_registers(
-            address, count=count, unit=self._slave_id
+        result = await read_input_registers(
+            self._client, address, count, self._slave_id
         )
         if result.isError():
             raise UpdateFailed(f"Modbus error reading register {address}: {result}")
