@@ -6,6 +6,6 @@
   "dependencies": [],
   "documentation": "",
   "iot_class": "local_polling",
-  "requirements": ["pymodbus>=3.6.0"],
+  "requirements": ["pymodbus>=3.0.0"],
   "version": "1.0.0"
 }

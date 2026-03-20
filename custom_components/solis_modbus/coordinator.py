@@ -78,7 +78,7 @@ class SolisModbusCoordinator(DataUpdateCoordinator):
     async def _read_input_registers(self, address: int, count: int) -> list[int]:
         """Read input registers (function code 0x04)."""
         result = await self._client.read_input_registers(
-            address=address, count=count, slave=self._slave_id
+            address, count, self._slave_id
         )
         if result.isError():
             raise UpdateFailed(f"Modbus error reading register {address}: {result}")
