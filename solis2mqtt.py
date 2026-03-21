@@ -140,6 +140,23 @@ STORAGE_MODE_FLAGS = {
     5: "Grid charge allowed",
 }
 
+STORAGE_MODE_REGISTER = 43110  # Holding register for storage control mode
+
+@dataclass
+class SwitchDef:
+    key: str
+    name: str
+    bit: int
+    icon: str | None = None
+
+STORAGE_SWITCHES: list[SwitchDef] = [
+    SwitchDef("storage_time_charging", "Time-Charging Mode", 1, icon="mdi:clock-outline"),
+    SwitchDef("storage_off_grid", "Off-Grid Mode", 2, icon="mdi:transmission-tower-off"),
+    SwitchDef("storage_battery_wakeup", "Battery Wakeup", 3, icon="mdi:battery-alert"),
+    SwitchDef("storage_battery_reserve", "Battery Reserve Mode", 4, icon="mdi:battery-lock"),
+    SwitchDef("storage_grid_charge", "Grid Charge Allowed", 5, icon="mdi:battery-charging"),
+]
+
 
 # --- Modbus reading ---
 
@@ -158,6 +175,23 @@ async def _read_regs(client: AsyncModbusTcpClient, slave_id: int,
         )
     await asyncio.sleep(INTER_FRAME_DELAY)
     return result.registers
+
+
+async def _read_holding(client: AsyncModbusTcpClient, slave_id: int,
+                        address: int) -> int:
+    result = await client.read_holding_registers(address, count=1, slave=slave_id)
+    if result.isError():
+        raise RuntimeError(f"Modbus error reading holding register {address}: {result}")
+    await asyncio.sleep(INTER_FRAME_DELAY)
+    return result.registers[0]
+
+
+async def _write_holding(client: AsyncModbusTcpClient, slave_id: int,
+                         address: int, value: int) -> None:
+    result = await client.write_register(address, value, slave=slave_id)
+    if result.isError():
+        raise RuntimeError(f"Modbus error writing holding register {address}: {result}")
+    await asyncio.sleep(INTER_FRAME_DELAY)
 
 
 async def read_serial(client: AsyncModbusTcpClient, slave_id: int) -> str:
@@ -287,7 +321,25 @@ async def publish_ha_discovery(mqtt: aiomqtt.Client, serial: str) -> None:
 
         await mqtt.publish(topic, json.dumps(payload), retain=True)
 
-    _LOGGER.info("Published HA discovery config for %d sensors", len(SENSORS))
+    # Switches for storage mode bits
+    for sw in STORAGE_SWITCHES:
+        topic = f"{HA_DISCOVERY_PREFIX}/switch/solis_{serial}/{sw.key}/config"
+        payload = {
+            "name": sw.name,
+            "unique_id": f"solis_{serial}_{sw.key}",
+            "state_topic": f"{MQTT_BASE_TOPIC}/{serial}/{sw.key}/state",
+            "command_topic": f"{MQTT_BASE_TOPIC}/{serial}/{sw.key}/set",
+            "device": device,
+            "availability_topic": f"{MQTT_BASE_TOPIC}/{serial}/availability",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+        }
+        if sw.icon:
+            payload["icon"] = sw.icon
+        await mqtt.publish(topic, json.dumps(payload), retain=True)
+
+    _LOGGER.info("Published HA discovery config for %d sensors + %d switches",
+                 len(SENSORS), len(STORAGE_SWITCHES))
 
 
 async def publish_state(mqtt: aiomqtt.Client, serial: str, data: dict) -> None:
@@ -299,6 +351,41 @@ async def publish_state(mqtt: aiomqtt.Client, serial: str, data: dict) -> None:
             await mqtt.publish(topic, str(value))
 
     await mqtt.publish(f"{MQTT_BASE_TOPIC}/{serial}/availability", "online", retain=True)
+
+
+async def publish_switch_states(mqtt: aiomqtt.Client, serial: str,
+                                mode_raw: int) -> None:
+    """Publish ON/OFF state for each storage mode switch."""
+    for sw in STORAGE_SWITCHES:
+        state = "ON" if mode_raw & (1 << sw.bit) else "OFF"
+        topic = f"{MQTT_BASE_TOPIC}/{serial}/{sw.key}/state"
+        await mqtt.publish(topic, state, retain=True)
+
+
+async def handle_switch_command(
+    modbus: AsyncModbusTcpClient,
+    slave_id: int,
+    mqtt: aiomqtt.Client,
+    serial: str,
+    switch_key: str,
+    payload: str,
+) -> None:
+    """Handle an ON/OFF command for a storage mode switch."""
+    sw = next((s for s in STORAGE_SWITCHES if s.key == switch_key), None)
+    if sw is None:
+        return
+
+    current = await _read_holding(modbus, slave_id, STORAGE_MODE_REGISTER)
+    if payload == "ON":
+        new_val = current | (1 << sw.bit)
+    else:
+        new_val = current & ~(1 << sw.bit)
+
+    if new_val != current:
+        await _write_holding(modbus, slave_id, STORAGE_MODE_REGISTER, new_val)
+        _LOGGER.info("Storage mode: 0x%04X -> 0x%04X (%s = %s)", current, new_val, sw.name, payload)
+
+    await publish_switch_states(mqtt, serial, new_val)
 
 
 # --- Main loop ---
@@ -334,44 +421,83 @@ async def main(
         username=mqtt_user,
         password=mqtt_pass,
     ) as mqtt:
-        while not stop_event.is_set():
-            try:
-                if not modbus.connected:
-                    await modbus.connect()
+        # Subscribe to switch command topics (wildcard)
+        await mqtt.subscribe(f"{MQTT_BASE_TOPIC}/+/+/set")
+        _LOGGER.info("Subscribed to %s/+/+/set for switch commands", MQTT_BASE_TOPIC)
+
+        async def poll_loop():
+            nonlocal serial, last_slow_read, slow_data
+            while not stop_event.is_set():
+                try:
                     if not modbus.connected:
-                        _LOGGER.error("Cannot connect to inverter, retrying in %ds…", interval)
-                        await asyncio.sleep(interval)
-                        continue
+                        await modbus.connect()
+                        if not modbus.connected:
+                            _LOGGER.error("Cannot connect to inverter, retrying in %ds…", interval)
+                            await asyncio.sleep(interval)
+                            continue
 
-                # Read serial once at startup
-                if serial is None:
-                    serial = await read_serial(modbus, slave_id)
-                    _LOGGER.info("Inverter serial: %s", serial)
-                    await publish_ha_discovery(mqtt, serial)
+                    # Read serial once at startup
+                    if serial is None:
+                        serial = await read_serial(modbus, slave_id)
+                        _LOGGER.info("Inverter serial: %s", serial)
+                        await publish_ha_discovery(mqtt, serial)
 
-                # Fast sensors every cycle
-                data = await read_fast(modbus, slave_id)
+                    # Fast sensors every cycle
+                    data = await read_fast(modbus, slave_id)
 
-                # Slow sensors every SLOW_POLL_INTERVAL seconds
-                now = asyncio.get_event_loop().time()
-                if now - last_slow_read >= SLOW_POLL_INTERVAL:
-                    slow_data = await read_slow(modbus, slave_id)
-                    last_slow_read = now
-                    _LOGGER.debug("Updated slow sensors")
+                    # Read storage mode from holding register and publish switch states
+                    storage_mode = await _read_holding(modbus, slave_id, STORAGE_MODE_REGISTER)
+                    await publish_switch_states(mqtt, serial, storage_mode)
 
-                data.update(slow_data)
-                await publish_state(mqtt, serial, data)
-                _LOGGER.debug("Published %d sensor values", len(data))
+                    # Slow sensors every SLOW_POLL_INTERVAL seconds
+                    now = asyncio.get_event_loop().time()
+                    if now - last_slow_read >= SLOW_POLL_INTERVAL:
+                        slow_data = await read_slow(modbus, slave_id)
+                        last_slow_read = now
+                        _LOGGER.debug("Updated slow sensors")
 
-            except Exception:
-                _LOGGER.exception("Error in poll loop")
-                if modbus.connected:
-                    modbus.close()
-                await asyncio.sleep(interval)
-                continue
+                    data.update(slow_data)
+                    await publish_state(mqtt, serial, data)
+                    _LOGGER.debug("Published %d sensor values", len(data))
 
-            if stop_event.is_set():
-                break
+                except Exception:
+                    _LOGGER.exception("Error in poll loop")
+                    if modbus.connected:
+                        modbus.close()
+                    await asyncio.sleep(interval)
+                    continue
+
+                if stop_event.is_set():
+                    break
+
+        async def command_loop():
+            async for message in mqtt.messages:
+                if stop_event.is_set():
+                    break
+                topic = message.topic.value
+                payload = message.payload.decode()
+                # Expected: solis/<serial>/<switch_key>/set
+                parts = topic.split("/")
+                if len(parts) == 4 and parts[3] == "set" and payload in ("ON", "OFF"):
+                    switch_key = parts[2]
+                    if serial and modbus.connected:
+                        try:
+                            await handle_switch_command(
+                                modbus, slave_id, mqtt, serial, switch_key, payload,
+                            )
+                        except Exception:
+                            _LOGGER.exception("Error handling command %s=%s", switch_key, payload)
+
+        poll_task = asyncio.create_task(poll_loop())
+        command_task = asyncio.create_task(command_loop())
+
+        # Wait for either task to finish (poll_loop exits on stop_event)
+        done, pending = await asyncio.wait(
+            [poll_task, command_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
 
         # Publish offline on clean shutdown
         if serial:
