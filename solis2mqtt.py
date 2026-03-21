@@ -179,7 +179,7 @@ async def _read_regs(client: AsyncModbusTcpClient, slave_id: int,
 
 async def _read_holding(client: AsyncModbusTcpClient, slave_id: int,
                         address: int) -> int:
-    result = await client.read_holding_registers(address, count=1, slave=slave_id)
+    result = await client.read_holding_registers(address, count=1, device_id=slave_id)
     if result.isError():
         raise RuntimeError(f"Modbus error reading holding register {address}: {result}")
     await asyncio.sleep(INTER_FRAME_DELAY)
@@ -188,7 +188,7 @@ async def _read_holding(client: AsyncModbusTcpClient, slave_id: int,
 
 async def _write_holding(client: AsyncModbusTcpClient, slave_id: int,
                          address: int, value: int) -> None:
-    result = await client.write_register(address, value, slave=slave_id)
+    result = await client.write_register(address, value, device_id=slave_id)
     if result.isError():
         raise RuntimeError(f"Modbus error writing holding register {address}: {result}")
     await asyncio.sleep(INTER_FRAME_DELAY)
