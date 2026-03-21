@@ -143,23 +143,26 @@ STORAGE_MODE_FLAGS = {
 
 # --- Modbus reading ---
 
-async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
-    """Read all sensor data from the inverter."""
+INTER_FRAME_DELAY = 0.35  # >300ms required by datalogger
+SLOW_POLL_INTERVAL = 300  # seconds between slow sensor reads
 
-    async def read(address: int, count: int) -> list[int]:
-        result = await client.read_input_registers(address, count=count, device_id=slave_id)
-        if result.isError():
-            raise RuntimeError(f"Modbus error reading register {address}: {result}")
-        if len(result.registers) < count:
-            raise RuntimeError(
-                f"Short read at register {address}: expected {count}, got {len(result.registers)}"
-            )
-        return result.registers
 
-    data = {}
+async def _read_regs(client: AsyncModbusTcpClient, slave_id: int,
+                     address: int, count: int) -> list[int]:
+    result = await client.read_input_registers(address, count=count, device_id=slave_id)
+    if result.isError():
+        raise RuntimeError(f"Modbus error reading register {address}: {result}")
+    if len(result.registers) < count:
+        raise RuntimeError(
+            f"Short read at register {address}: expected {count}, got {len(result.registers)}"
+        )
+    await asyncio.sleep(INTER_FRAME_DELAY)
+    return result.registers
 
-    # Model and serial (33000-33027)
-    regs = await read(33000, 28)
+
+async def read_serial(client: AsyncModbusTcpClient, slave_id: int) -> str:
+    """Read inverter serial number (once at startup)."""
+    regs = await _read_regs(client, slave_id, 33000, 28)
     sn_chars = []
     for i in range(4, 20):
         val = _u16(regs, i)
@@ -169,15 +172,13 @@ async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
             sn_chars.append(chr(high))
         if low > 0:
             sn_chars.append(chr(low))
-    data["serial_number"] = "".join(sn_chars)
+    return "".join(sn_chars)
 
-    # Energy (33029-33040)
-    regs = await read(33029, 12)
-    data["total_energy"] = _u32(regs, 0)
-    data["month_energy"] = _u32(regs, 2)
-    data["today_energy"] = round(_u16(regs, 6) * 0.1, 1)
-    data["yesterday_energy"] = round(_u16(regs, 7) * 0.1, 1)
-    data["year_energy"] = _u32(regs, 8)
+
+async def read_fast(client: AsyncModbusTcpClient, slave_id: int) -> dict:
+    """Read real-time sensors (~1.4s per cycle, 4 reads)."""
+    read = lambda addr, count: _read_regs(client, slave_id, addr, count)
+    data = {}
 
     # DC inputs (33049-33058)
     regs = await read(33049, 10)
@@ -202,9 +203,12 @@ async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
     status_raw = _u16(regs, 24)
     data["inverter_status"] = INVERTER_STATUS_MAP.get(status_raw, f"Unknown (0x{status_raw:04X})")
 
-    # Meter & battery (33126-33148)
+    # Meter & battery (33126-33148) — includes storage mode at 33132
     regs = await read(33126, 23)
     data["meter_active_power"] = _s32(regs, 4)
+    mode_raw = _u16(regs, 6)  # 33132
+    active = [name for bit, name in STORAGE_MODE_FLAGS.items() if mode_raw & (1 << bit)]
+    data["storage_control_mode"] = ", ".join(active) if active else "None"
     data["battery_voltage"] = round(_u16(regs, 7) * 0.1, 1)
     data["battery_current"] = round(_s16(regs, 8) * 0.1, 1)
     data["battery_soc"] = _u16(regs, 13)
@@ -216,6 +220,22 @@ async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
     regs = await read(33149, 9)
     data["battery_power"] = _s32(regs, 0)
     data["grid_port_power"] = _s32(regs, 2)
+
+    return data
+
+
+async def read_slow(client: AsyncModbusTcpClient, slave_id: int) -> dict:
+    """Read energy counters and slowly-changing sensors (~0.7s, 2 reads)."""
+    read = lambda addr, count: _read_regs(client, slave_id, addr, count)
+    data = {}
+
+    # Energy generation (33029-33040)
+    regs = await read(33029, 12)
+    data["total_energy"] = _u32(regs, 0)
+    data["month_energy"] = _u32(regs, 2)
+    data["today_energy"] = round(_u16(regs, 6) * 0.1, 1)
+    data["yesterday_energy"] = round(_u16(regs, 7) * 0.1, 1)
+    data["year_energy"] = _u32(regs, 8)
 
     # Battery/grid/load energy (33161-33180)
     regs = await read(33161, 20)
@@ -229,12 +249,6 @@ async def read_inverter(client: AsyncModbusTcpClient, slave_id: int) -> dict:
     data["today_grid_export_energy"] = round(_u16(regs, 14) * 0.1, 1)
     data["total_load_energy"] = _u32(regs, 16)
     data["today_load_energy"] = round(_u16(regs, 18) * 0.1, 1)
-
-    # Storage control mode (33132)
-    regs = await read(33132, 1)
-    mode_raw = _u16(regs, 0)
-    active = [name for bit, name in STORAGE_MODE_FLAGS.items() if mode_raw & (1 << bit)]
-    data["storage_control_mode"] = ", ".join(active) if active else "None"
 
     return data
 
@@ -302,12 +316,14 @@ async def main(
         loop.add_signal_handler(sig, stop_event.set)
 
     _LOGGER.info(
-        "Starting solis2mqtt: Modbus %s:%d (slave %d) -> MQTT %s:%d (every %ds)",
-        modbus_host, modbus_port, slave_id, mqtt_host, mqtt_port, interval,
+        "Starting solis2mqtt: Modbus %s:%d (slave %d) -> MQTT %s:%d (continuous polling)",
+        modbus_host, modbus_port, slave_id, mqtt_host, mqtt_port,
     )
 
     modbus = AsyncModbusTcpClient(host=modbus_host, port=modbus_port, timeout=10)
     serial = None
+    last_slow_read = 0.0
+    slow_data: dict = {}
 
     async with aiomqtt.Client(
         hostname=mqtt_host,
@@ -320,30 +336,39 @@ async def main(
                 if not modbus.connected:
                     await modbus.connect()
                     if not modbus.connected:
-                        _LOGGER.error("Cannot connect to inverter, retrying in %ds", interval)
+                        _LOGGER.error("Cannot connect to inverter, retrying in %ds…", interval)
                         await asyncio.sleep(interval)
                         continue
 
-                data = await read_inverter(modbus, slave_id)
-
+                # Read serial once at startup
                 if serial is None:
-                    serial = data["serial_number"]
+                    serial = await read_serial(modbus, slave_id)
                     _LOGGER.info("Inverter serial: %s", serial)
                     await publish_ha_discovery(mqtt, serial)
 
+                # Fast sensors every cycle
+                data = await read_fast(modbus, slave_id)
+
+                # Slow sensors every SLOW_POLL_INTERVAL seconds
+                now = asyncio.get_event_loop().time()
+                if now - last_slow_read >= SLOW_POLL_INTERVAL:
+                    slow_data = await read_slow(modbus, slave_id)
+                    last_slow_read = now
+                    _LOGGER.debug("Updated slow sensors")
+
+                data.update(slow_data)
                 await publish_state(mqtt, serial, data)
-                _LOGGER.debug("Published %d sensor values", len(data) - 1)
+                _LOGGER.debug("Published %d sensor values", len(data))
 
             except Exception:
                 _LOGGER.exception("Error in poll loop")
                 if modbus.connected:
                     modbus.close()
+                await asyncio.sleep(interval)
+                continue
 
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            if stop_event.is_set():
                 break
-            except asyncio.TimeoutError:
-                pass
 
         # Publish offline on clean shutdown
         if serial:
@@ -362,7 +387,7 @@ if __name__ == "__main__":
     parser.add_argument("--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT", "1883")))
     parser.add_argument("--mqtt-user", default=os.environ.get("MQTT_USER"))
     parser.add_argument("--mqtt-pass", default=os.environ.get("MQTT_PASS"))
-    parser.add_argument("--interval", type=int, default=30, help="Poll interval in seconds")
+    parser.add_argument("--interval", type=int, default=10, help="Retry delay in seconds after errors")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
