@@ -210,7 +210,9 @@ async def read_fast(client: AsyncModbusTcpClient, slave_id: int) -> dict:
     active = [name for bit, name in STORAGE_MODE_FLAGS.items() if mode_raw & (1 << bit)]
     data["storage_control_mode"] = ", ".join(active) if active else "None"
     data["battery_voltage"] = round(_u16(regs, 7) * 0.1, 1)
-    data["battery_current"] = round(_s16(regs, 8) * 0.1, 1)
+    bat_current = _u16(regs, 8) * 0.1
+    bat_discharging = _u16(regs, 9) == 1  # 33135: 0=charge, 1=discharge
+    data["battery_current"] = round(-bat_current if bat_discharging else bat_current, 1)
     data["battery_soc"] = _u16(regs, 13)
     data["battery_soh"] = _u16(regs, 14)
     data["household_load_power"] = _u16(regs, 21)
@@ -218,7 +220,8 @@ async def read_fast(client: AsyncModbusTcpClient, slave_id: int) -> dict:
 
     # Battery & grid port power (33149-33157)
     regs = await read(33149, 9)
-    data["battery_power"] = _s32(regs, 0)
+    bat_power = abs(_s32(regs, 0))
+    data["battery_power"] = -bat_power if bat_discharging else bat_power
     data["grid_port_power"] = _s32(regs, 2)
 
     return data
