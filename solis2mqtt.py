@@ -142,6 +142,32 @@ STORAGE_MODE_FLAGS = {
 
 STORAGE_MODE_REGISTER = 43110  # Holding register for storage control mode
 
+
+@dataclass
+class NumberDef:
+    key: str
+    name: str
+    address: int         # holding register address (fc 0x03 / 0x06)
+    unit: str
+    min_val: float
+    max_val: float
+    step: float
+    scale: float         # raw register = value / scale
+    icon: str | None = None
+
+
+NUMBER_SETTINGS: list[NumberDef] = [
+    NumberDef(
+        "max_charge_current", "Max Charge Current", 43117,
+        "A", 0, 100, 0.1, 0.1, icon="mdi:current-dc",
+    ),
+    NumberDef(
+        "max_discharge_current", "Max Discharge Current", 43118,
+        "A", 0, 100, 0.1, 0.1, icon="mdi:current-dc",
+    ),
+]
+
+
 @dataclass
 class SwitchDef:
     key: str
@@ -338,8 +364,28 @@ async def publish_ha_discovery(mqtt: aiomqtt.Client, serial: str) -> None:
             payload["icon"] = sw.icon
         await mqtt.publish(topic, json.dumps(payload), retain=True)
 
-    _LOGGER.info("Published HA discovery config for %d sensors + %d switches",
-                 len(SENSORS), len(STORAGE_SWITCHES))
+    # Number entities for charge/discharge limits
+    for num in NUMBER_SETTINGS:
+        topic = f"{HA_DISCOVERY_PREFIX}/number/solis_{serial}/{num.key}/config"
+        payload = {
+            "name": num.name,
+            "unique_id": f"solis_{serial}_{num.key}",
+            "state_topic": f"{MQTT_BASE_TOPIC}/{serial}/{num.key}/state",
+            "command_topic": f"{MQTT_BASE_TOPIC}/{serial}/{num.key}/set",
+            "device": device,
+            "availability_topic": f"{MQTT_BASE_TOPIC}/{serial}/availability",
+            "unit_of_measurement": num.unit,
+            "min": num.min_val,
+            "max": num.max_val,
+            "step": num.step,
+            "mode": "slider",
+        }
+        if num.icon:
+            payload["icon"] = num.icon
+        await mqtt.publish(topic, json.dumps(payload), retain=True)
+
+    _LOGGER.info("Published HA discovery config for %d sensors + %d switches + %d numbers",
+                 len(SENSORS), len(STORAGE_SWITCHES), len(NUMBER_SETTINGS))
 
 
 async def publish_state(mqtt: aiomqtt.Client, serial: str, data: dict) -> None:
@@ -360,6 +406,44 @@ async def publish_switch_states(mqtt: aiomqtt.Client, serial: str,
         state = "ON" if mode_raw & (1 << sw.bit) else "OFF"
         topic = f"{MQTT_BASE_TOPIC}/{serial}/{sw.key}/state"
         await mqtt.publish(topic, state, retain=True)
+
+
+async def publish_number_states(mqtt: aiomqtt.Client, serial: str,
+                                modbus: AsyncModbusTcpClient, slave_id: int) -> None:
+    """Read and publish current value for each number entity."""
+    for num in NUMBER_SETTINGS:
+        try:
+            raw = await _read_holding(modbus, slave_id, num.address)
+            value = round(raw * num.scale, 1)
+            topic = f"{MQTT_BASE_TOPIC}/{serial}/{num.key}/state"
+            await mqtt.publish(topic, str(value), retain=True)
+        except Exception:
+            _LOGGER.exception("Error reading number %s (reg %d)", num.key, num.address)
+
+
+async def handle_number_command(
+    modbus: AsyncModbusTcpClient,
+    slave_id: int,
+    mqtt: aiomqtt.Client,
+    serial: str,
+    number_key: str,
+    payload: str,
+) -> None:
+    """Handle a numeric value command for a charge/discharge limit."""
+    num = next((n for n in NUMBER_SETTINGS if n.key == number_key), None)
+    if num is None:
+        return
+
+    value = float(payload)
+    value = max(num.min_val, min(num.max_val, value))
+    raw = int(round(value / num.scale))
+
+    await _write_holding(modbus, slave_id, num.address, raw)
+    _LOGGER.info("%s: set to %.1f%s (raw: %d)", num.name, value, num.unit, raw)
+
+    # Publish back the confirmed state
+    topic = f"{MQTT_BASE_TOPIC}/{serial}/{num.key}/state"
+    await mqtt.publish(topic, str(value), retain=True)
 
 
 async def handle_switch_command(
@@ -449,6 +533,9 @@ async def main(
                     storage_mode = await _read_holding(modbus, slave_id, STORAGE_MODE_REGISTER)
                     await publish_switch_states(mqtt, serial, storage_mode)
 
+                    # Publish number entity states (charge/discharge limits)
+                    await publish_number_states(mqtt, serial, modbus, slave_id)
+
                     # Slow sensors every SLOW_POLL_INTERVAL seconds
                     now = asyncio.get_event_loop().time()
                     if now - last_slow_read >= SLOW_POLL_INTERVAL:
@@ -476,17 +563,21 @@ async def main(
                     break
                 topic = message.topic.value
                 payload = message.payload.decode()
-                # Expected: solis/<serial>/<switch_key>/set
+                # Expected: solis/<serial>/<key>/set
                 parts = topic.split("/")
-                if len(parts) == 4 and parts[3] == "set" and payload in ("ON", "OFF"):
-                    switch_key = parts[2]
-                    if serial and modbus.connected:
-                        try:
+                if len(parts) == 4 and parts[3] == "set" and serial and modbus.connected:
+                    key = parts[2]
+                    try:
+                        if payload in ("ON", "OFF"):
                             await handle_switch_command(
-                                modbus, slave_id, mqtt, serial, switch_key, payload,
+                                modbus, slave_id, mqtt, serial, key, payload,
                             )
-                        except Exception:
-                            _LOGGER.exception("Error handling command %s=%s", switch_key, payload)
+                        else:
+                            await handle_number_command(
+                                modbus, slave_id, mqtt, serial, key, payload,
+                            )
+                    except Exception:
+                        _LOGGER.exception("Error handling command %s=%s", key, payload)
 
         poll_task = asyncio.create_task(poll_loop())
         command_task = asyncio.create_task(command_loop())

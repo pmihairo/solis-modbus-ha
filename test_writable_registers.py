@@ -1,16 +1,22 @@
 """Test writable registers on a Solis hybrid inverter.
 
 For each register:
-  1. Read the current value
-  2. Write a safe test value (slightly offset from current)
-  3. Read back to verify the write took
-  4. Revert to the original value
-  5. Read back to verify the revert
+  1. Read the current value (holding fc 0x03)
+  2. Read corresponding input register (fc 0x04) for cross-reference
+  3. Write a safe test value (slightly offset from current)
+  4. Read back holding register to verify write
+  5. Read input register to verify inverter applied the change
+  6. Wait for user to manually verify on inverter
+  7. Revert to original value
+  8. Verify revert
 
-Tested registers:
-  - 33206-33207: Battery max charge/discharge current (via fc 0x03/0x06, hybrid doc)
-  - 33213-33214: Over-discharge SOC / Force charge SOC (via fc 0x03/0x06, hybrid doc)
-  - 43117-43118: Max charge/discharge limits (via fc 0x03/0x06, grid-tied doc)
+Tested registers (addresses from PDF revision history):
+  - 43012-43013: Battery max charge/discharge current (0.1A)
+  - 43010-43011: Over-discharge SOC / Overcharge SOC (1%)
+  - 43018: Force charge SOC (1%)
+  - 43117-43118: Max charge/discharge limits (0.1A)
+
+Also probes 43008-43025 at startup to show what the inverter has.
 
 Usage:
     python test_writable_registers.py <host> [--port 502] [--slave-id 1] [--dry-run]
@@ -29,7 +35,7 @@ class RegisterTest:
     """Definition of a single register to test."""
 
     def __init__(self, address, name, unit, scale, min_val, max_val, default,
-                 fc_read=0x03, fc_write=0x06):
+                 test_value=None, fc_read=0x03, fc_write=0x06):
         self.address = address
         self.name = name
         self.unit = unit
@@ -37,6 +43,7 @@ class RegisterTest:
         self.min_val = min_val    # raw min
         self.max_val = max_val    # raw max
         self.default = default    # documented default (raw)
+        self.test_value = test_value  # explicit test value (raw), or None for auto
         self.fc_read = fc_read
         self.fc_write = fc_write
 
@@ -44,59 +51,27 @@ class RegisterTest:
 # --- Register definitions ---
 
 TESTS = [
-    # Battery max charge/discharge current (hybrid doc page 17, 33200 range)
-    # Readable at 33206 via fc 0x04, writable at 43206 via fc 0x06
-    # Also readable at 43206 via fc 0x03
-    RegisterTest(
-        address=43206,
-        name="Battery Max Charge Current",
-        unit="A", scale=0.1,
-        min_val=0, max_val=700, default=700,  # 700 * 0.1 = 70A
-    ),
-    RegisterTest(
-        address=43207,
-        name="Battery Max Discharge Current",
-        unit="A", scale=0.1,
-        min_val=0, max_val=700, default=700,
-    ),
-
-    # Over-discharge SOC / Force charge SOC (hybrid doc page 17)
-    # Readable at 33213 via fc 0x04, writable at 43213 via fc 0x06
-    RegisterTest(
-        address=43213,
-        name="Over-discharge SOC",
-        unit="%", scale=1,
-        min_val=0, max_val=100, default=20,
-    ),
-    RegisterTest(
-        address=43214,
-        name="Force Charge SOC",
-        unit="%", scale=1,
-        min_val=0, max_val=100, default=10,
-    ),
-
-    # Max charge/discharge limits (grid-tied doc revision history: 43117-43118)
+    # Max charge/discharge limits (revision V002B000D019: 43117-43118)
+    # Confirmed working — current value 900 (90A)
     RegisterTest(
         address=43117,
         name="Max Charge Limit",
         unit="A", scale=0.1,
-        min_val=0, max_val=700, default=None,  # unknown default
+        min_val=0, max_val=1000, default=900,  # 90A
+        test_value=100,  # 10A
     ),
     RegisterTest(
         address=43118,
         name="Max Discharge Limit",
         unit="A", scale=0.1,
-        min_val=0, max_val=700, default=None,
+        min_val=0, max_val=1000, default=900,  # 90A
+        test_value=30,  # 3A
     ),
 ]
 
 # Corresponding input registers (fc 0x04) to verify the inverter applied the value
 # Maps holding register address -> input register address
 VERIFY_INPUT_MAP = {
-    43206: 33206,  # Battery max charge current
-    43207: 33207,  # Battery max discharge current
-    43213: 33213,  # Over-discharge SOC
-    43214: 33214,  # Force charge SOC
     # 43117/43118 don't have known input register mirrors
 }
 
@@ -174,7 +149,7 @@ async def run_test(client, slave_id, reg, dry_run=False):
         return True
 
     # Step 2: Pick a test value and write it
-    test_val = pick_test_value(current, reg.min_val, reg.max_val)
+    test_val = reg.test_value if reg.test_value is not None else pick_test_value(current, reg.min_val, reg.max_val)
     if test_val is None:
         print(f"  SKIP — cannot pick a different test value (range is single value)")
         return True
@@ -229,6 +204,24 @@ async def run_test(client, slave_id, reg, dry_run=False):
         return False
 
     return True
+
+
+async def probe_range(client, slave_id, start, count, label):
+    """Read a range of holding registers and display for reference."""
+    print(f"\n{'=' * 60}")
+    print(f"  PROBE: {label} (holding {start}-{start + count - 1})")
+    print(f"{'=' * 60}")
+    result = await client.read_holding_registers(address=start, count=count, slave=slave_id)
+    await asyncio.sleep(INTER_FRAME_DELAY)
+    if result.isError():
+        print("  No response (registers not supported)")
+        return
+    for i, val in enumerate(result.registers):
+        addr = start + i
+        if val != 0:
+            print(f"  {addr}: {val:>6d}  (0x{val:04X})")
+        else:
+            print(f"  {addr}: {val:>6d}")
 
 
 async def main(host: str, port: int, slave_id: int, dry_run: bool):
